@@ -41,11 +41,19 @@ def _rotor_thrust(params, n, V_axial):
     return params['k_T'] * n**2 * fac
 
 
+# z축 기체의 호버 자세. scalar-last 규약이라 [1,0,0,0]은 단위 쿼터니언이
+# 아니라 x축 180° 회전이다 — 동체 z-down을 세계 z-up으로 뒤집어, 동체 -z
+# 추력이 세계 +z(위)를 향하게 한다. find_trim(V=0)이 정확히 이 값을 낸다.
+# 여기에 단위 쿼터니언 [0,0,0,1]을 넣으면 기체가 거꾸로라 NMPC가 T=0을
+# 고르고 뒤집으려 α를 포화시킨다(실제로 한 번 당했다).
+Q_HOVER_Z = [1.0, 0.0, 0.0, 0.0]
+
+
 def _state(n, v=(0.0, 0.0, 0.0), omega=(0.0, 0.0, 0.0), z=50.0):
     x = np.zeros(17)
     x[2] = z
     x[3:6] = v
-    x[6:10] = [0.0, 0.0, 0.0, 1.0]      # z축 호버 (scalar-last)
+    x[6:10] = Q_HOVER_Z
     x[10:13] = omega
     x[13:17] = n
     return x
@@ -195,3 +203,114 @@ def test_c2_constrains_the_first_input_near_the_allocation(limit):
     assert d_free > limit                        # 제한이 의미 있는 상황인지 먼저
     assert d_c2 <= limit + 1e-6                  # 만족
     assert d_c2 == pytest.approx(limit, rel=1e-3)  # 활성 제약이라 경계에 붙는다
+
+
+# ── cost_spec='paper' (식13-18·31) ────────────────────────────────────
+
+def test_legacy_is_the_default_cost_spec():
+    m = VirtualNMPC(P, v_ref=[12, 0, 0], z_ref=50.)
+    assert m.cost_spec == 'legacy'
+    assert m.w0.size == 20*13 + 20*4          # x₀가 파라미터인 기존 배치
+
+
+def test_paper_mode_problem_size_matches_eq31():
+    """식(31) n_var,13 = (N+1)·13 + N·4 = 353. x₀를 결정변수에 넣어야 나온다."""
+    m = VirtualNMPC(P, v_ref=[12, 0, 0], z_ref=50., cost_spec='paper')
+    assert m.w0.size == (m.N + 1)*13 + m.N*4 == 353
+    assert m.lbg.size == (m.N + 1)*13         # 초기상태 등식 + N개 전이
+
+
+def test_paper_mode_input_bounds_match_eq18():
+    """식(18) 0 ≤ T ≤ T_max,0 및 |α_i| ≤ 100 rad/s²."""
+    m = VirtualNMPC(P, v_ref=[12, 0, 0], z_ref=50., cost_spec='paper')
+    nx = 13
+    assert m.lbw[nx] == 0.0
+    assert m.ubw[nx] == pytest.approx(4*P['k_T']*P['n_max']**2)
+    np.testing.assert_allclose(m.ubw[nx+1:nx+4], 100.0)
+    np.testing.assert_allclose(m.lbw[nx+1:nx+4], -100.0)
+
+
+def test_paper_mode_cost_is_exactly_eq14_to_eq18():
+    """비용함수를 논문식 손계산과 대조한다 — 전사가 맞는지의 직접 증거."""
+    m = VirtualNMPC(P, v_ref=[12, 0, 0], z_ref=50., cost_spec='paper')
+    N, nx, nu = m.N, 13, 4
+    J_fn = m.solver.get_function('nlp_f')
+
+    rng = np.random.default_rng(11)
+    w = m.w0 + rng.standard_normal(m.w0.size)
+    refs = rng.standard_normal((4, N+1))*3 + np.array([[12.], [0.], [0.], [50.]])
+    nu_prev = np.array([0.9*P['mass']*P['g'], 1., -2., .5])
+    x_meas = np.concatenate([_state(np.zeros(4))[0:10],
+                             _state(np.zeros(4))[10:13]])
+    p_val = np.concatenate([x_meas, refs.ravel(order='F'), nu_prev])
+
+    # 손계산: 배치는 X_0,U_0,X_1,U_1,…,X_{N-1},U_{N-1},X_N
+    mg = P['mass']*P['g']
+    D_nu = np.array([mg, 100., 100., 100.])      # 식(15)
+    nu_h = np.array([mg, 0., 0., 0.])
+    Xs, Us, i = [], [], 0
+    for _ in range(N):
+        Xs.append(w[i:i+nx]); i += nx
+        Us.append(w[i:i+nu]); i += nu
+    Xs.append(w[i:i+nx]); i += nx
+    assert i == w.size
+
+    def stage(X, k):                             # 식(14)
+        return (5.0*np.sum((X[3:6] - refs[0:3, k])**2)
+                + 20.0*(X[2] - refs[3, k])**2
+                + np.sum(X[10:13]**2))
+
+    expected, u_prev = 0.0, nu_prev
+    for k in range(N):
+        expected += stage(Xs[k], k)
+        expected += 0.02*np.sum(((Us[k] - nu_h)/D_nu)**2)    # 식(17) 1항
+        expected += 0.10*np.sum(((Us[k] - u_prev)/D_nu)**2)  # 식(17) 2항
+        u_prev = Us[k]
+    expected += 10.0*stage(Xs[N], N)             # 식(16) 종말 10배 (ω 포함)
+
+    assert float(J_fn(w, p_val)[0]) == pytest.approx(expected, rel=1e-12)
+
+
+def test_paper_mode_hovers_at_mg():
+    """호버 트림에서 T=mg, α=0 — 부호·축이 뒤집혔으면 여기서 깨진다."""
+    from control.trim import find_trim
+    tr = find_trim(P, 0.0, quiet=True)
+    assert tr['converged']
+    x = np.zeros(17)
+    x[2] = 50.
+    x[6:10] = tr['state'][6:10]
+    x[13:17] = tr['state'][13:17]
+
+    m = VirtualNMPC(P, v_ref=[0, 0, 0], z_ref=50., cost_spec='paper',
+                    max_iter=300)
+    u = m(0., x)
+    assert m.last_status == 'Solve_Succeeded'
+    assert u[0] == pytest.approx(P['mass']*P['g'], rel=1e-4)
+    np.testing.assert_allclose(u[1:4], 0.0, atol=1e-5)
+
+
+def test_ref_fn_fills_the_prediction_horizon():
+    """식(14)의 r_{j|k} — 노드마다 참조가 달라야 램프를 추종할 수 있다."""
+    m = VirtualNMPC(P, cost_spec='paper',
+                    ref_fn=lambda t: (5. + 2.*t, 0., 0., 50.))
+    m._t_now = 1.0
+    R = m._reference_horizon()
+    assert R.shape == (4, m.N + 1)
+    # t=1.0부터 dt_nmpc=0.05 간격
+    np.testing.assert_allclose(R[0], 5. + 2.*(1.0 + 0.05*np.arange(m.N+1)))
+    np.testing.assert_allclose(R[3], 50.)
+
+    # ref_fn이 없으면 상수 참조로 모든 노드를 채운다
+    c = VirtualNMPC(P, v_ref=[9, 1, 0], z_ref=30., cost_spec='paper')
+    Rc = c._reference_horizon()
+    np.testing.assert_allclose(Rc, np.tile([[9.], [1.], [0.], [30.]], (1, c.N+1)))
+
+
+def test_ref_fn_is_rejected_in_legacy_mode():
+    with pytest.raises(ValueError, match='ref_fn'):
+        VirtualNMPC(P, ref_fn=lambda t: (0., 0., 0., 0.))
+
+
+def test_bad_cost_spec_is_rejected():
+    with pytest.raises(ValueError, match='cost_spec'):
+        VirtualNMPC(P, cost_spec='v53')

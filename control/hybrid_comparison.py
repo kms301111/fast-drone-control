@@ -82,8 +82,38 @@ class VirtualNMPC:
 
     def __init__(self, params, v_ref=None, z_ref=0.0, T_ref=None,
                  N=20, dt_nmpc=0.05, dt_ctrl=0.02, Q_z=20.0, max_iter=30,
-                 alloc_feedback=False, c2_limit=None):
+                 alloc_feedback=False, c2_limit=None,
+                 cost_spec='legacy', ref_fn=None):
         """
+        cost_spec : {'legacy','paper'}
+            'legacy' (기본값) — 이 클래스가 원래 쓰던 비용/구조. 기존 결과
+            (results/, mission_sim, robustness_*)를 재현하려면 이쪽이어야 한다.
+
+            'paper' — 논문 v5.3 식(13)-(18)·(31)의 **정확한** 전사. legacy와
+            다음이 다르다(감사 결과, m=1.7117 기준):
+
+              항          논문(식)              legacy            차이
+              속도가중    5·I₃ (식14)           diag(5,5,10)      vz만 2배
+              각속도가중  ‖ω‖² (식14)           diag(1,1,1)       같음
+              입력편차T   0.02/(mg)²=7.09e-5    1e-5              7.1배 약함
+              입력편차α   0.02/100²=2e-6        1e-3              500배 강함
+              입력변화T   0.1/(mg)²=3.55e-4     1e-4              3.5배 약함
+              입력변화α   0.1/100²=1e-5         0.01              1000배 강함
+              종말가중    stage 전체×10 (식16)  v·z만×10          ω 누락
+              참조        노드별 r_{j|k} (식14) 상수 1개          램프 불가
+              적분        RK4 5회+정규화(4.2절) RK4 1회           정확도
+              결정변수    (N+1)nx+N·nu=353(식31) 340(x₀는 파라미터)
+
+            legacy에는 Dν 정규화(식15) 자체가 없어서 '튜닝으로 고른 값'이
+            아니라 다른 세대의 구현으로 보인다. 논문 실험은 'paper'로 돌려야
+            한다 — legacy로 돌리면 논문이 적어 놓은 비용함수와 코드가 다르다.
+
+        ref_fn : callable | None
+            'paper'에서만 쓰인다. ``ref_fn(t) -> (vx, vy, vz, z)``로 절대시각
+            t의 참조를 준다. 식(14)의 r_{j|k}를 예측 노드마다 채우기 위한 것
+            으로, 램프/가감속 프로필 추종에 필요하다. None이면 v_ref·z_ref를
+            모든 노드에 같은 값으로 채운다(상수 참조).
+
         alloc_feedback : bool
             논문 식(27)-(28) C1. 배분 결과를 다음 솔브의 입력변화량 비용
             기준 ν_{-1|k}으로 쓴다. 표6의 V13-1 → V13-2 단계.
@@ -105,6 +135,11 @@ class VirtualNMPC:
             주의: ν_alloc이 실제로 들어와야 의미가 있으므로 alloc_feedback=True
             (C1)와 함께 써야 한다. 아래에서 그 조합을 검사한다.
         """
+        if cost_spec not in ('legacy', 'paper'):
+            raise ValueError(f"cost_spec must be 'legacy' or 'paper', got {cost_spec!r}")
+        if ref_fn is not None and cost_spec != 'paper':
+            raise ValueError("ref_fn은 cost_spec='paper'에서만 쓸 수 있다 — "
+                             "legacy 경로는 참조가 상수 하나뿐이다.")
         if c2_limit is not None:
             if c2_limit <= 0:
                 raise ValueError(f"c2_limit must be positive, got {c2_limit}")
@@ -124,6 +159,8 @@ class VirtualNMPC:
         # 쓴다 — 기본값 False로 기존 호출부(mission_sim 등) 동작을 보존한다.
         self.alloc_feedback = alloc_feedback
         self.c2_limit = c2_limit
+        self.cost_spec = cost_spec
+        self.ref_fn = ref_fn
 
         self.T_ref = T_ref if T_ref else params['mass'] * params['g']
         self.u_ref = np.array([self.T_ref, 0, 0, 0])
@@ -131,16 +168,23 @@ class VirtualNMPC:
 
         f, x_sym, u_sym = build_virtual_dynamics(params)
 
-        # RK4
-        dt = dt_nmpc
-        k1 = f(x_sym, u_sym)
-        k2 = f(x_sym + dt/2*k1, u_sym)
-        k3 = f(x_sym + dt/2*k2, u_sym)
-        k4 = f(x_sym + dt*k3, u_sym)
-        self.F = ca.Function('F_v', [x_sym, u_sym],
-                             [x_sym + dt/6*(k1 + 2*k2 + 2*k3 + k4)])
-
-        self._build_nlp(params, x_sym, u_sym)
+        if cost_spec == 'paper':
+            # 4.2절: 각 예측 격자에서 RK4 5회 세부적분 + 쿼터니언 정규화.
+            self.F = self._make_substep_integrator(f, x_sym, u_sym, substeps=5)
+            self._build_nlp_paper(params, x_sym, u_sym)
+        else:
+            # RK4 (1회 — legacy)
+            dt = dt_nmpc
+            k1 = f(x_sym, u_sym)
+            k2 = f(x_sym + dt/2*k1, u_sym)
+            k3 = f(x_sym + dt/2*k2, u_sym)
+            k4 = f(x_sym + dt*k3, u_sym)
+            self.F = ca.Function('F_v', [x_sym, u_sym],
+                                 [x_sym + dt/6*(k1 + 2*k2 + 2*k3 + k4)])
+            self._build_nlp(params, x_sym, u_sym)
+        self._t_now = 0.0       # ref_fn 평가 시각. _solve 시그니처를 못 바꿔서
+                                # (bench_*·final_config_mission이 위치인자 1개로
+                                #  호출하고 몽키패치까지 한다) 필드로 전달한다.
         self._last_t = -np.inf
         self._u_current = self.u_ref.copy()
         # 솔버 수렴 추적 (연속 미수렴 → HybridWithFallback의 전환 판단에 사용)
@@ -247,17 +291,146 @@ class VirtualNMPC:
         self.w0 = np.array(w0)
         self._w0_init = self.w0.copy()
 
+    def _make_substep_integrator(self, f, x_sym, u_sym, substeps=5):
+        """예측 격자 하나를 RK4 세부적분으로 넘긴다 (논문 4.2절).
+
+        한 번에 h=50 ms를 RK4로 넘기면, 자세·각속도가 빠르게 움직이는 구간에서
+        적분 오차가 예측을 왜곡한다. 세부적분으로 실효 스텝을 10 ms로 줄이고,
+        매 세부단계마다 쿼터니언을 정규화해 단위노름에서 벗어나지 않게 한다
+        (정규화를 안 하면 RK4가 노름을 조금씩 키워 자세가 서서히 뒤틀린다).
+        """
+        h = self.dt_nmpc / substeps
+        st = x_sym
+        for _ in range(substeps):
+            k1 = f(st, u_sym)
+            k2 = f(st + h/2*k1, u_sym)
+            k3 = f(st + h/2*k2, u_sym)
+            k4 = f(st + h*k3, u_sym)
+            st = st + h/6*(k1 + 2*k2 + 2*k3 + k4)
+            st = ca.vertcat(st[0:6], st[6:10]/ca.norm_2(st[6:10]), st[10:13])
+        return ca.Function('F_paper', [x_sym, u_sym], [st])
+
+    def _build_nlp_paper(self, params, x_sym, u_sym):
+        """논문 v5.3 식(13)-(18)·(31)의 직접 전사.
+
+        legacy와 나란히 두고 읽을 수 있게 따로 뺐다. 한 함수에 플래그를
+        섞으면 '논문이 뭐라고 했는지'가 분기 속에 묻힌다.
+        """
+        N, nx, nu = self.N, NX_V, NU_V
+
+        # 식(15): 가상입력 정규화 척도와 호버 기준값.
+        #   Dν = diag(mg, 100, 100, 100),  νh = [mg, 0, 0, 0]ᵀ
+        # 100은 식(18)의 각가속도 한계와 같은 수라 각 성분이 '한계의 몇 %'가 된다.
+        D_nu = ca.DM([self.T_ref, 100.0, 100.0, 100.0])
+        nu_h = ca.DM([self.T_ref, 0.0, 0.0, 0.0])
+
+        # 식(18): 0 ≤ T ≤ T_max,0 (정지 유속에서의 4로터 합), |α_i| ≤ 100 rad/s²
+        T_max = 4 * params['k_T'] * params['n_max']**2
+        a_max = 100.0
+
+        # p 레이아웃: [x_meas(nx), refs(4·(N+1)), nu_prev(nu)]
+        #   refs 는 노드별 (vx,vy,vz,z) — 식(14)의 r_{j|k}.
+        p = ca.SX.sym('p', nx + 4*(N+1) + nu)
+        x_meas = p[0:nx]
+        refs = ca.reshape(p[nx:nx + 4*(N+1)], 4, N+1)
+        nu_prev = p[nx + 4*(N+1):]
+
+        # 결정변수: X_0, U_0, X_1, U_1, …, X_{N-1}, U_{N-1}, X_N
+        #   x₀를 결정변수에 넣고 등식으로 묶는 직접 다중사격 형태 — 식(31)의
+        #   n_var = (N+1)·n_x + N·n_u = 21·13 + 20·4 = 353 이 이 배치에서 나온다.
+        w, w0, lbw, ubw = [], [], [], []
+        g, lbg, ubg = [], [], []
+        J_cost = 0.0
+
+        _q_hover = ([0.0, -np.sqrt(0.5), 0.0, np.sqrt(0.5)]
+                    if params.get('thrust_axis', 'z') == 'x'
+                    else [1.0, 0.0, 0.0, 0.0])
+
+        def new_state(k):
+            X = ca.SX.sym(f'X_{k}', nx)
+            w.append(X)
+            lbw.extend([-1e6]*nx); ubw.extend([1e6]*nx)
+            guess = [0.0]*nx
+            guess[6:10] = _q_hover          # 유효 단위 쿼터니언으로 시작
+            w0.extend(guess)
+            return X
+
+        X_k = new_state(0)
+        g.append(X_k - x_meas)              # 측정 상태 고정
+        lbg.extend([0.0]*nx); ubg.extend([0.0]*nx)
+
+        U_prev = nu_prev
+        for k in range(N):
+            # ── 단계 상태비용 식(14) ──
+            e_v = X_k[3:6] - refs[0:3, k]
+            e_z = X_k[2] - refs[3, k]
+            J_cost += (5.0*ca.sumsqr(e_v) + self._Q_z*e_z**2
+                       + ca.sumsqr(X_k[10:13]))
+
+            U_k = ca.SX.sym(f'U_{k}', nu)
+            w.append(U_k)
+            lbw.extend([0.0, -a_max, -a_max, -a_max])
+            ubw.extend([T_max, a_max, a_max, a_max])
+            w0.extend([float(self.T_ref), 0.0, 0.0, 0.0])
+
+            # ── 입력비용 식(17) — Dν로 무차원화한 두 항 ──
+            J_cost += 0.02*ca.sumsqr((U_k - nu_h) / D_nu)
+            J_cost += 0.10*ca.sumsqr((U_k - U_prev) / D_nu)
+
+            if k == 0 and self.c2_limit is not None:
+                g.append(ca.sumsqr((U_k - nu_prev) / D_nu))
+                lbg.append(0.0); ubg.append(float(self.c2_limit)**2)
+
+            X_next = new_state(k+1)
+            g.append(X_next - self.F(X_k, U_k))
+            lbg.extend([0.0]*nx); ubg.extend([0.0]*nx)
+            X_k, U_prev = X_next, U_k
+
+        # ── 종말비용 식(16): 단계 상태비용 '전체'에 10배 (ω 포함) ──
+        e_v = X_k[3:6] - refs[0:3, N]
+        e_z = X_k[2] - refs[3, N]
+        J_cost += 10.0*(5.0*ca.sumsqr(e_v) + self._Q_z*e_z**2
+                        + ca.sumsqr(X_k[10:13]))
+
+        nlp = {'f': J_cost, 'x': ca.vertcat(*w), 'g': ca.vertcat(*g), 'p': p}
+        self.solver = ca.nlpsol('vnmpc_paper', 'ipopt', nlp, {
+            'ipopt.print_level': 0, 'ipopt.sb': 'yes', 'print_time': 0,
+            'ipopt.max_iter': self._max_iter, 'ipopt.warm_start_init_point': 'yes',
+            'ipopt.tol': 1e-4})
+        self.lbw = np.array(lbw)
+        self.ubw = np.array(ubw)
+        self.lbg = np.array(lbg)
+        self.ubg = np.array(ubg)
+        self.w0 = np.array(w0)
+        self._w0_init = self.w0.copy()
+
+    def _reference_horizon(self):
+        """예측 노드별 (vx,vy,vz,z) 참조 — 식(14)의 r_{j|k}."""
+        if self.ref_fn is None:
+            one = np.concatenate([self.v_ref, [self.z_ref]])
+            return np.tile(one[:, None], (1, self.N + 1))
+        cols = [np.asarray(self.ref_fn(self._t_now + k*self.dt_nmpc),
+                           dtype=float)
+                for k in range(self.N + 1)]
+        return np.stack(cols, axis=1)
+
     def __call__(self, t, x_full):
         """17D 플랜트 상태 → 13D 추출 → [T, ν_ω] 반환."""
         if t - self._last_t >= self.dt_ctrl - 1e-8:
             x13 = np.concatenate([x_full[0:10], x_full[10:13]])
+            self._t_now = t
             self._u_current = self._solve(x13)
             self._last_t = t
         return self._u_current
 
     def _solve(self, x13):
-        p_val = np.concatenate([x13, self.v_ref, [self.z_ref], self.u_ref,
-                                 self._prev_input])
+        if self.cost_spec == 'paper':
+            p_val = np.concatenate([x13,
+                                    self._reference_horizon().ravel(order='F'),
+                                    self._prev_input])
+        else:
+            p_val = np.concatenate([x13, self.v_ref, [self.z_ref], self.u_ref,
+                                     self._prev_input])
         sol = self.solver(x0=self.w0, lbx=self.lbw, ubx=self.ubw,
                           lbg=self.lbg, ubg=self.ubg, p=p_val)
 
@@ -275,9 +448,19 @@ class VirtualNMPC:
         self.last_status = status
 
         w_opt = np.array(sol['x']).flatten()
-        u_opt = w_opt[0:NU_V]
         stride = NU_V + NX_V
-        self.w0 = np.concatenate([w_opt[stride:], w_opt[-stride:]])
+        if self.cost_spec == 'paper':
+            # 배치: X_0, U_0, X_1, U_1, …, X_{N-1}, U_{N-1}, X_N
+            #   → 첫 입력은 X_0 뒤에 있고, 워밍시프트는 한 단계 버린 뒤
+            #     마지막 (U_{N-1}, X_N)을 복제해 길이를 되맞춘다.
+            u_opt = w_opt[NX_V:NX_V + NU_V]
+            self.w0 = np.concatenate([w_opt[stride:],
+                                      w_opt[-stride:-NX_V],   # U_{N-1}
+                                      w_opt[-NX_V:]])         # X_N
+        else:
+            # 배치: U_0, X_0, U_1, X_1, … (legacy)
+            u_opt = w_opt[0:NU_V]
+            self.w0 = np.concatenate([w_opt[stride:], w_opt[-stride:]])
         return u_opt
 
 
