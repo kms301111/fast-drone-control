@@ -275,7 +275,9 @@ def report(params, trims, rows, out_txt="results/flight_envelope.txt"):
     A(f"{'V[m/s]':>7} {'theta[deg]':>11} {'alpha[deg]':>11} {'n_max[rad/s]':>13} "
       f"{'회전수사용':>10} {'추력사용':>9} {'잔차':>10}")
     for t in trims:
-        A(f"{t['V']:7.0f} {np.degrees(t['theta']):11.2f} {np.degrees(t['alpha']):11.2f} "
+        # 정지(V=0)에서는 받음각이 정의되지 않아 find_trim 이 None 을 돌려준다.
+        alpha_text = '        n/a' if t['alpha'] is None else f"{np.degrees(t['alpha']):11.2f}"
+        A(f"{t['V']:7.0f} {np.degrees(t['theta']):11.2f} {alpha_text} "
           f"{t['n_max_used']:13.1f} {t['rotor_use']:9.1%} {t['thrust_use']:8.1%} "
           f"{t['residual']:10.1e}")
     A(f"  -> 전 {len(trims)}개 속도점 트림 성립. 최고 트림속도는 85 m/s (306 km/h).")
