@@ -1,5 +1,8 @@
 """
-BatteryModel(식11-14) + NMPCController(electrical_constraints, 식22) 검증.
+BatteryModel + NMPCController(electrical_constraints) 검증.
+⚠ 논문 v5.3 범위 밖 — 전류·전압·배터리는 모델에서 제외되고 고정 회전수
+한계로 대체된다(논문 132행·608행). 실기 쪽 자산으로 남겨 두는 테스트다.
+아래 식번호는 이 모듈 자체의 전력수지 식이며 논문 식번호가 아니다.
 """
 
 import numpy as np

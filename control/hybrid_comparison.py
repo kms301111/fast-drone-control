@@ -82,17 +82,48 @@ class VirtualNMPC:
 
     def __init__(self, params, v_ref=None, z_ref=0.0, T_ref=None,
                  N=20, dt_nmpc=0.05, dt_ctrl=0.02, Q_z=20.0, max_iter=30,
-                 alloc_feedback=False):
+                 alloc_feedback=False, c2_limit=None):
+        """
+        alloc_feedback : bool
+            논문 식(27)-(28) C1. 배분 결과를 다음 솔브의 입력변화량 비용
+            기준 ν_{-1|k}으로 쓴다. 표6의 V13-1 → V13-2 단계.
+        c2_limit : float | None
+            논문 5.4절 변형 **C2**. 첫 예측 입력이 배분값에서 정규화 거리
+            ``‖Dν⁻¹(ν_0|k − ν_alloc)‖ ≤ c2_limit`` 안에 있도록 **제약**한다.
+            None(기본값)이면 제약을 걸지 않아 기존 동작이 그대로 보존된다.
+
+            왜 필요한가 — C1은 식(17)의 첫 변화량 항 하나에만 작용하는 '비용'
+            이라, 다른 입력 비용에 묻혀 효과가 안 보일 수 있다(논문 202행).
+            C2는 같은 정보를 '제약'으로 올려 연결 강도를 높인 것이다. C0↔C1
+            차이가 프로필 편차 안에 머물고 C2에서만 차이가 나면, 배분 피드백의
+            효과는 연결 방식에 의존한다는 결론이 나온다.
+
+            한계값은 논문이 "예비 시험으로 정한다"고만 해서 숫자를 박지 않았다.
+            Dν로 무차원화했으므로 1.0이면 '호버 추력 하나만큼' 떨어질 수 있다는
+            뜻이다.
+
+            주의: ν_alloc이 실제로 들어와야 의미가 있으므로 alloc_feedback=True
+            (C1)와 함께 써야 한다. 아래에서 그 조합을 검사한다.
+        """
+        if c2_limit is not None:
+            if c2_limit <= 0:
+                raise ValueError(f"c2_limit must be positive, got {c2_limit}")
+            if not alloc_feedback:
+                raise ValueError(
+                    "c2_limit은 alloc_feedback=True(C1)와 함께 써야 한다 — "
+                    "C1이 꺼져 있으면 기준값이 고정 트림이라 '배분값 주변 제한'이 "
+                    "아니라 '트림 주변 제한'이 되어 다른 실험이 된다.")
         self.p = params
         self.N, self.dt_nmpc, self.dt_ctrl = N, dt_nmpc, dt_ctrl
         self.v_ref = np.array(v_ref) if v_ref is not None else np.zeros(3)
         self.z_ref = z_ref
         self._Q_z = Q_z
         self._max_iter = max_iter   # IPOPT 반복 상한 (SITL 실시간용 축소 가능)
-        # 논문 식(31)-(32): INDI 배분 결과를 다음 솔브의 입력변화량 비용
-        # 기준(v_{-1|k})으로 쓸지 여부. False면 기존과 동일하게 고정 트림값을
+        # 논문 식(27)-(28): INDI 배분 결과를 다음 솔브의 입력변화량 비용
+        # 기준(ν_{-1|k})으로 쓸지 여부. False면 기존과 동일하게 고정 트림값을
         # 쓴다 — 기본값 False로 기존 호출부(mission_sim 등) 동작을 보존한다.
         self.alloc_feedback = alloc_feedback
+        self.c2_limit = c2_limit
 
         self.T_ref = T_ref if T_ref else params['mass'] * params['g']
         self.u_ref = np.array([self.T_ref, 0, 0, 0])
@@ -131,7 +162,7 @@ class VirtualNMPC:
 
     def set_prev_input(self, v):
         """INDI 배분 결과(v_alloc)를 다음 솔브의 입력변화량 비용 기준으로 받는다
-        (식31-32). alloc_feedback=False면 무시 — 항상 안전하게 호출 가능."""
+        (식27-28). alloc_feedback=False면 무시 — 항상 안전하게 호출 가능."""
         if self.alloc_feedback:
             self._prev_input = np.asarray(v, dtype=float)
 
@@ -150,7 +181,7 @@ class VirtualNMPC:
 
         # p 레이아웃: [x_init(nx), v_ref(3), z_ref(1), u_ref(nu), u_prev(nu)]
         # u_ref: 매 단계 정규화 목표(트림) — 항상 고정.
-        # u_prev: 0단계 입력변화량 비용의 기준(식31-32의 v_{-1|k}).
+        # u_prev: 0단계 입력변화량 비용의 기준(식28의 ν_{-1|k}).
         #         alloc_feedback=False면 u_ref와 동일값이 매번 들어온다(기존과 동일 동작).
         p = ca.SX.sym('p', nx + 3 + 1 + nu + nu)
         x_init = p[0:nx]
@@ -182,6 +213,14 @@ class VirtualNMPC:
 
             g.append(X_k - self.F(X_prev, U_k))
             lbg += [0.0]*nx; ubg += [0.0]*nx
+
+            if k == 0 and self.c2_limit is not None:
+                # C2 (논문 5.4절): 첫 예측 입력을 배분값 주변으로 제한.
+                # Dν = diag(mg, 100, 100, 100) 로 무차원화 — 식(15)와 같은 척도.
+                # 노름 대신 제곱노름을 쓴다(0에서 미분 불가한 sqrt 회피).
+                D_nu = ca.DM([self.T_ref, 100.0, 100.0, 100.0])
+                g.append(ca.sumsqr((U_k - u_prev) / D_nu))
+                lbg += [0.0]; ubg += [float(self.c2_limit)**2]
 
             e_v = X_k[3:6] - v_ref
             e_z = X_k[2] - z_ref
@@ -245,12 +284,12 @@ class VirtualNMPC:
 def constrained_allocation(G, dT_target, domega_target, n_actual, n_min, n_max,
                             max_iter=4):
     """
-    총추력 등식 제약 하 각가속도 잔차 최소 배분 — 논문 식(28)-(29)/부록A.2-A.3의
+    총추력 등식 제약 하 각가속도 잔차 최소 배분 — 논문 식(24)-(26)/부록 식(A2)-(A3)의
     증분(Δn) 공간 국소 해.
 
     G(4x4)는 현재 동작점의 선형 입력효과 행렬(0행=∂T/∂n, 1-3행=∂ω̇/∂n,
     ProperHybrid._compute_G와 동일). dT_target·domega_target은 INDI 증분
-    목표(요구-측정, 식24의 소신호 가정). 반환하는 Δn은:
+    목표(요구-측정, 식20 B(f)=∂b/∂f의 소신호 가정). 반환하는 Δn은:
       Σ G[0,i]·Δn_i = dT_target  을 (포화가 없는 한) 정확히 만족시키고,
     그 부분공간 안에서 ||G[1:4]·Δn - domega_target||²를 최소화한다.
 
@@ -261,7 +300,7 @@ def constrained_allocation(G, dT_target, domega_target, n_actual, n_min, n_max,
 
     논문 본문이 별도로 쓰는 외곽 비선형 재선형화 + 감쇠 후보(1,1/2,1/4,1/8)
     루프는 적용하지 않는다 — INDI 증분은 이미 1ms마다 재선형화되는 소신호
-    영역이라(식24) 1회 선형화로 충분하다고 판단했다. 필요해지면 이 함수를
+    영역이라(식20) 1회 선형화로 충분하다고 판단했다. 필요해지면 이 함수를
     감싸는 바깥 루프를 추가하면 된다(이 함수 경계는 그러도록 분리해 뒀다).
 
     Returns
@@ -325,16 +364,40 @@ class ProperHybrid:
     """
 
     def __init__(self, virtual_nmpc, params, dt=0.001, f_cut=50.0,
-                 alloc_mode='A0'):
+                 alloc_mode='A0', time_align='S0'):
         """
         alloc_mode : {'A0','A1'}
             'A0' (기본값, 기존 동작 보존) — 비제약 최소자승 + 사후 clip.
-            'A1' — 논문 식(28)-(29) 총추력 등식 배분(constrained_allocation).
+            'A1' — 논문 식(24)-(26) 총추력 등식 배분(constrained_allocation).
             논문 표6의 A0↔A1 제거실험이 바로 이 플래그다.
+        time_align : {'S0','S1'}
+            논문 표6의 V13-2 → V13 단계(추가 요소 S1)를 켜는 플래그.
+
+            'S0' (기본값, 기존 동작 보존) — 각가속도에만 LPF를 걸고, 로터 추력은
+            현재 표본의 생값을 쓴다. 두 신호의 시간 기준이 다르다.
+
+            'S1' — 논문 식(22)-(23). 두 가지를 바꾼다.
+              ① 시각 정렬: 자이로를 차분한 각가속도는 두 표본 **사이**의 평균
+                 변화라서 시각이 반 표본 앞선다. 로터 힘도 인접 표본의 중간값
+                 f_mid,k = (f_k + f_{k-1})/2 로 맞춘다.
+              ② 같은 필터: 각가속도와 로터 추력·토크에 **동일한** LPF를 쓰고,
+                 계수도 논문식 λ = 1 - exp(-2π f_c Δt_i) 로 계산한다.
+
+            왜 중요한가 — 두 신호에 서로 다른 필터·시간 기준을 쓰면, 실제 외란이
+            없어도 모터 명령이 바뀌는 것만으로 (T_cmd - T_meas)에 위상 오차가
+            생긴다. INDI는 그 차이를 외란으로 읽고 보정하므로, 가상 외란을
+            스스로 만들어 쫓는 셈이 된다(논문 4.5절).
+
+            주의: S0의 LPF 계수는 후향차분 근사 Δt/(Δt+τ)이고 S1은 지수적분형
+            이다. dt=1 ms, f_c=50 Hz에서 0.2394 대 0.2696으로 12% 다르다.
+            같은 필터의 다른 이산화이므로 S0↔S1 비교에는 이 차이도 섞여 있다.
         """
+        if time_align not in ('S0', 'S1'):
+            raise ValueError(f"time_align must be 'S0' or 'S1', got {time_align!r}")
         self.nmpc = virtual_nmpc
         self.p = params
         self.dt = dt
+        self.f_cut = f_cut
         self._tau = 1.0 / (2*np.pi*f_cut)     # LPF 시상수 (가변 dt에서 alpha 재계산용)
         self._alpha = dt / (dt + self._tau)
         self._omega_prev = np.zeros(3)
@@ -342,14 +405,29 @@ class ProperHybrid:
         self._prev_t = None                   # 실제 Δt 측정용 (SITL 루프율 가변/100Hz미만)
         self._initialized = False
         self.alloc_mode = alloc_mode
-        self.last_alloc = None                 # 식(31)-(32) 배분 결과 (보고·피드백용)
+        self.time_align = time_align
+        # S1 전용 상태: 직전 표본의 로터별 추력(중간값 정렬용)과 그 LPF 출력.
+        self._f_prev = None                   # f_{k-1} (N, 로터별)
+        self._f_filt = None                   # LPF 통과한 f_mid — 0이 아니라
+                                              # 첫 f_mid로 초기화한다(호버 추력은
+                                              # mg≠0이라 0에서 시작하면 INDI가
+                                              # 없는 추력 부족을 크게 본다)
+        self.last_alloc = None                 # 식(27) 배분 결과 (보고·피드백용)
         _, self._TM_to_f = compute_allocation_matrix(params)
+
+    def _lpf_coeff(self, actual_dt):
+        """이번 표본의 LPF 계수. S1은 논문 식(23), S0은 기존 후향차분 근사."""
+        if self.time_align == 'S1':
+            return 1.0 - np.exp(-2*np.pi*self.f_cut*actual_dt)
+        return actual_dt / (actual_dt + self._tau)
 
     def reset(self):
         self._omega_prev = np.zeros(3)
         self._omega_dot_filt = np.zeros(3)
         self._prev_t = None
         self._initialized = False
+        self._f_prev = None
+        self._f_filt = None
         # VirtualNMPC 완전 리셋 (타이밍 + warm start + w0)
         if hasattr(self.nmpc, 'reset'):
             self.nmpc.reset()
@@ -378,7 +456,9 @@ class ProperHybrid:
         actual_dt = t - self._prev_t if self._prev_t is not None else self.dt
         actual_dt = min(max(actual_dt, 1e-4), 0.2)      # 0/과대 방지
         self._prev_t = t
-        alpha = actual_dt / (actual_dt + self._tau)      # 가변 dt에 맞춰 LPF 재계산
+        alpha = self._lpf_coeff(actual_dt)              # 가변 dt에 맞춰 LPF 재계산
+        # 식(22) 앞부분. 차분값은 두 표본 '사이'의 평균 변화라 시각이 반 표본
+        # 앞선다 — S1은 아래 로터 힘을 이 시각에 맞춘다.
         raw = (omega - self._omega_prev) / actual_dt
         self._omega_dot_filt = alpha*raw + (1-alpha)*self._omega_dot_filt
         self._omega_prev = omega.copy()
@@ -391,14 +471,34 @@ class ProperHybrid:
         V_axial = max(v_body[0] if self.p.get('thrust_axis', 'z') == 'x'
                       else -v_body[2], 0.0)
 
-        # 전진비 보정된 추력 측정
-        T_meas = 0.0
+        # 전진비 보정된 로터별 추력 f_k
+        f_k = np.empty(4)
         for i in range(4):
             ni = n_actual[i]
             n_rps = ni / (2 * np.pi)
             J = V_axial / (n_rps * self.p['D_prop'] + 1e-8)
             fac = max(1.0 - J / self.p['J_max'], 0.0)
-            T_meas += self.p['k_T'] * ni**2 * fac
+            f_k[i] = self.p['k_T'] * ni**2 * fac
+
+        if self.time_align == 'S1':
+            # 식(22) 뒷부분 + 식(23): 중간시각 정렬 후 각가속도와 '같은' 필터.
+            if self._f_prev is None:
+                self._f_prev = f_k.copy()      # 첫 표본은 f_{k-1}=f_k로 시작
+            f_mid = 0.5*(f_k + self._f_prev)
+            self._f_prev = f_k.copy()
+            if self._f_filt is None:
+                # 0에서 시작하면 안 된다 — 호버 추력은 mg≠0이라 LPF가 올라오는
+                # 동안 INDI가 '없는 추력 부족'을 크게 보고 과보정한다.
+                self._f_filt = f_mid.copy()
+            else:
+                self._f_filt = alpha*f_mid + (1-alpha)*self._f_filt
+            f_used = self._f_filt
+        else:
+            f_used = f_k                       # S0: 현재 표본 생값(기존 동작)
+
+        T_meas = 0.0
+        for i in range(4):
+            T_meas += f_used[i]
 
         dv = np.array([T_cmd - T_meas,
                        omega_dot_des[0] - self._omega_dot_filt[0],
@@ -415,7 +515,7 @@ class ProperHybrid:
                                          self.p['n_min'], self.p['n_max'])
             n_cmd = np.clip(n_actual + dn, self.p['n_min'], self.p['n_max'])
 
-            # 식(31)-(32): 명목 배분 결과를 가상입력 공간으로 되돌려 저장.
+            # 식(27): 명목 배분 결과를 가상입력 공간으로 되돌려 저장.
             T_alloc = T_meas + G[0] @ dn
             omega_alloc = self._omega_dot_filt + G[1:4] @ dn
             self.last_alloc = np.concatenate([[T_alloc], omega_alloc])
@@ -434,7 +534,7 @@ class ProperHybrid:
         return np.clip(n_actual + dn, self.p['n_min'], self.p['n_max'])
 
     def _rotor_thrust_cap(self, V_axial):
-        """현재 유속·명목 최대 회전수에서 로터별 추력 상한 f_max,i (식28)."""
+        """현재 유속·명목 최대 회전수에서 로터별 추력 상한 f_max,i (식A2)."""
         n_i = self.p['n_max']
         n_rps = n_i / (2 * np.pi)
         J = V_axial / (n_rps * self.p['D_prop'] + 1e-8)

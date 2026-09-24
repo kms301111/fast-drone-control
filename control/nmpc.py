@@ -41,11 +41,15 @@ class NMPCController:
         dt_nmpc  : float  NMPC 내부 적분 스텝 [s]
         dt_ctrl  : float  제어 주기 (이 간격마다 NLP 재풀이) [s]
         electrical_constraints : bool
-            논문 식(22) — 모터 전류·전압 제약을 예측 격자마다 부과할지.
+            모터 전류·전압 제약을 예측 격자마다 부과할지.
+            ⚠ 논문 v5.3 범위 밖 — 132행이 "전류·전압 한계와 배터리 전압
+            강하는 모델에 포함하지 않는다 … 고정된 회전수 한계로 대체한다"고
+            명시한다(7.4절 한계에도 재기술). 기본값 False를 유지할 것.
+            실기(PX4) 쪽에서 쓸 수 있어 코드는 남겨 둔다.
             기본값 False로 기존 M17 동작·테스트를 보존한다(표6의 E0).
             True가 실제 논문 M17(E1) — 이게 표6의 E0↔E1 제거실험 플래그다.
         V_b : float or None
-            예측 구간 내내 고정해서 쓸 버스 전압(식22 앞부분: "예측 전압은
+            예측 구간 내내 고정해서 쓸 버스 전압(논문 범위 밖: "예측 전압은
             현재 측정된 V_b로 유지, SOC의 미래 변화는 직접 예측하지 않음").
             None이면 params['V_oc'](만충 가정)로 시작하고, 매 호출 전
             self.V_b를 갱신해 실제 배터리 상태를 반영할 수 있다.
@@ -113,7 +117,7 @@ class NMPCController:
 
         # ── 파라미터: [x_init(17), v_ref(3), z_ref(1), u_ref(4), V_b(1)] = 26 ──
         # V_b: 전기제약(electrical_constraints)용 — 예측 구간 내내 고정해서 쓰는
-        # 현재 측정 버스전압(식22). 제약을 안 쓸 때도 자리만 차지, 계산엔 안 씀.
+        # 현재 측정 버스전압(논문 범위 밖). 제약을 안 쓸 때도 자리만 차지, 계산엔 안 씀.
         p = ca.SX.sym('p', nx + 3 + 1 + nu + 1)
         x_init = p[0:nx]
         v_ref  = p[nx:nx+3]
@@ -152,7 +156,7 @@ class NMPCController:
             lbg += [0.0] * nx
             ubg += [0.0] * nx
 
-            # ── 전류·전압 제약 (식22, electrical_constraints=True일 때만) ──
+            # ── 전류·전압 제약 (논문 v5.3 범위 밖, electrical_constraints=True일 때만) ──
             # M17만의 특징 — 모터 상태(X_k[13:17]=n)와 명령(U_k=n_c)이 이미
             # 결정변수에 있어 추가 상태 없이 바로 부과할 수 있다.
             if self.electrical_constraints:

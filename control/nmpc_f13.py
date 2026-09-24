@@ -228,7 +228,7 @@ class F13VirtualAdapter:
 
     def set_prev_input(self, v):
         """ProperHybrid가 alloc_mode='A1'일 때만 호출하는 훅. F13은 정의상
-        배분결과 피드백(식31-32, V13 전용)을 쓰지 않으므로 항상 무시한다."""
+        배분결과 피드백(식27-28, V13 전용)을 쓰지 않으므로 항상 무시한다."""
         pass
 
     @property
