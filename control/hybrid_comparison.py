@@ -97,14 +97,18 @@ class VirtualNMPC:
     def __init__(self, params, v_ref=None, z_ref=0.0, T_ref=None,
                  N=20, dt_nmpc=0.05, dt_ctrl=0.02, Q_z=20.0, max_iter=30,
                  alloc_feedback=False, c2_limit=None,
-                 cost_spec='legacy', ref_fn=None):
+                 cost_spec='paper', ref_fn=None):
         """
-        cost_spec : {'legacy','paper'}
-            'legacy' (기본값) — 이 클래스가 원래 쓰던 비용/구조. 기존 결과
-            (results/, mission_sim, robustness_*)를 재현하려면 이쪽이어야 한다.
+        cost_spec : {'paper','legacy'}
+            'paper' (**기본값**, 2026-09-24부터) — 논문 v5.3 식(13)-(18)·(31)의
+            정확한 전사.
 
-            'paper' — 논문 v5.3 식(13)-(18)·(31)의 **정확한** 전사. legacy와
-            다음이 다르다(감사 결과, m=1.7117 기준):
+            'legacy' — 이 클래스가 원래 쓰던 비용/구조. 2026-09-24 이전의 기존
+            결과(results/, mission_sim, robustness_*)를 재현할 때만 쓴다. 그
+            결과들은 기체 모델 자체가 달랐던 시절의 것이라 비교 대상이 아니다
+            (kj 판단) — 그래서 기본값을 'paper'로 뒤집었다.
+
+            둘의 차이(감사 결과, m=1.7117 기준):
 
               항          논문(식)              legacy            차이
               속도가중    5·I₃ (식14)           diag(5,5,10)      vz만 2배

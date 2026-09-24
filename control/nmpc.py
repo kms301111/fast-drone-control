@@ -65,6 +65,17 @@ class NMPCController:
         self.v_ref = np.array(v_ref) if v_ref is not None else np.zeros(3)
         self.z_ref = z_ref
         self._Q_z = Q_z
+        # ⚠ 이 제어기의 비용함수는 아직 **legacy** 다 — 논문 v5.3 식(14)-(18)과
+        #   다르다: 속도가중이 diag(5,5,10)(논문은 5·I₃), 종말비용에 ω가 빠졌고
+        #   (논문 식16은 stage 전체에 10배), 입력 가중에 Dν 정규화(식15)가 없어
+        #   척도가 어긋나고, 참조가 상수 하나라 노드별 r_{j|k}(식14)가 아니다.
+        #
+        #   2026-09-24에 VirtualNMPC(V13) 기본값만 cost_spec='paper'로 뒤집었다.
+        #   **표5·표6 비교를 이 상태로 돌리면 불공정하다** — V13 이 올바른 비용을
+        #   받아서 이기는 결과가 나온다. 논문 §5.3 의 "원인 분석 모드에서는 …
+        #   한 요소씩 바꾼다"를 지키려면 비교군 전체가 같은 비용을 써야 한다.
+        #   비교 스크립트는 모든 제어기의 cost_spec 이 같은지 확인할 것.
+        self.cost_spec = 'legacy'
         self._solve_log = []
         if u_ref is not None:
             self.u_ref = np.array(u_ref)

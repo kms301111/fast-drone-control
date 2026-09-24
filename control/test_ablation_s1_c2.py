@@ -207,10 +207,13 @@ def test_c2_constrains_the_first_input_near_the_allocation(limit):
 
 # ── cost_spec='paper' (식13-18·31) ────────────────────────────────────
 
-def test_legacy_is_the_default_cost_spec():
+def test_paper_is_the_default_cost_spec():
+    """2026-09-24부터 기본값이 논문식이다. 기존 결과 재현용 legacy는 남아 있다."""
     m = VirtualNMPC(P, v_ref=[12, 0, 0], z_ref=50.)
-    assert m.cost_spec == 'legacy'
-    assert m.w0.size == 20*13 + 20*4          # x₀가 파라미터인 기존 배치
+    assert m.cost_spec == 'paper'
+    assert m.w0.size == 21*13 + 20*4          # 식(31) n_var,13 = 353
+    old = VirtualNMPC(P, v_ref=[12, 0, 0], z_ref=50., cost_spec='legacy')
+    assert old.w0.size == 20*13 + 20*4        # x₀가 파라미터인 옛 배치
 
 
 def test_paper_mode_problem_size_matches_eq31():
@@ -307,10 +310,41 @@ def test_ref_fn_fills_the_prediction_horizon():
 
 
 def test_ref_fn_is_rejected_in_legacy_mode():
+    """legacy 경로는 참조가 상수 하나뿐이라 노드별 참조를 받을 수 없다."""
     with pytest.raises(ValueError, match='ref_fn'):
-        VirtualNMPC(P, ref_fn=lambda t: (0., 0., 0., 0.))
+        VirtualNMPC(P, cost_spec='legacy', ref_fn=lambda t: (0., 0., 0., 0.))
 
 
 def test_bad_cost_spec_is_rejected():
     with pytest.raises(ValueError, match='cost_spec'):
         VirtualNMPC(P, cost_spec='v53')
+
+
+# ── 비교군 간 비용함수 일치 ───────────────────────────────────────────
+
+def test_every_comparison_controller_declares_its_cost_spec():
+    """표5·표6 비교군이 같은 비용을 쓰는지 프로그램적으로 확인할 수 있어야 한다.
+
+    논문 §5.3: "원인 분석 모드에서는 플랜트, 상태 정보, 참조, 예측 구간, 명목
+    공력, 입력 갱신률과 솔버 설정을 일치시키고 한 요소씩 바꾼다." 비용함수도
+    그 '일치시킬 것'에 들어간다 — 한쪽만 논문식이면 그 차이가 구조 차이로
+    오인된다.
+
+    이 테스트는 **일치를 요구하지 않는다**(지금 일치하지 않는다). 각 제어기가
+    자기 비용을 선언하게 만들어, 비교 스크립트가 섞인 상태를 감지할 수 있게
+    하는 것이 목적이다. M17·F13 정렬이 끝나면 아래 기대값을 'paper'로 바꾼다.
+    """
+    from control.nmpc import NMPCController
+    from control.nmpc_f13 import RotorThrustNMPC13
+
+    declared = {
+        'V13': VirtualNMPC(P).cost_spec,
+        'M17': NMPCController(P).cost_spec,
+        'F13': RotorThrustNMPC13(P).cost_spec,
+    }
+    assert all(v in ('paper', 'legacy') for v in declared.values()), declared
+    # 현재 상태를 명시적으로 고정한다 — M17·F13 을 정렬하면 여기가 깨지고,
+    # 그때 이 테스트가 "비교군 전체가 paper 다"로 바뀌어야 한다.
+    assert declared == {'V13': 'paper', 'M17': 'legacy', 'F13': 'legacy'}, (
+        f"비교군 비용함수 상태가 바뀌었다: {declared}. "
+        "전부 'paper'가 되었다면 이 테스트를 일치 요구로 바꿀 것.")

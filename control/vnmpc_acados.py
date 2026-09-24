@@ -116,6 +116,10 @@ class AcadosVirtualNMPC:
                 'EXT_EXACT는 균일 그리드 전제 (실험용)'
         self.as_rti_iter = as_rti_iter
         self.as_rti_level = as_rti_level
+        # VirtualNMPC 와 같은 이름의 속성을 둬서, 논문 결과 생성기가 어떤
+        # 비용을 쓰는지 프로그램적으로 확인할 수 있게 한다. 이 클래스는 아직
+        # legacy 비용만 구현한다(_build_solver 의 base_W 주석 참조).
+        self.cost_spec = 'legacy'
         self.nx_solver = NX_V + (NU_V if self.rate_aug else 0)
         self._u_state = self.u_ref.copy()      # rate_aug: 적분된 현재 명령
         T_max = 4 * params['k_T'] * params['n_max']**2
@@ -145,6 +149,17 @@ class AcadosVirtualNMPC:
         model = AcadosModel()
         model.name = f'vnmpc_{code_suffix}'
 
+        # ⚠ 이 가중치는 VirtualNMPC 의 **legacy** 비용이고 논문 v5.3 식(14)-(18)
+        #   과 다르다: 속도가중이 diag(5,5,10)(논문은 5·I₃), 입력 가중에 Dν
+        #   정규화(식15)가 없어 α 항이 논문의 500배·변화량은 1000배, 종말비용에
+        #   ω가 빠지고 참조도 노드별이 아니다.
+        #
+        #   이 클래스는 IPOPT판 legacy와 수치적으로 등가가 되도록 만든 것이라
+        #   (아래 R_du 등가 주석) 그대로 둔다. 2026-09-24에 VirtualNMPC 기본값을
+        #   'paper'로 뒤집었으므로 **두 경로는 이제 다른 문제를 푼다**. 논문
+        #   결과를 acados로 내려면 여기도 식(14)-(18)로 맞춰야 하는데, 노드별
+        #   참조와 Dν 정규화를 NLS 구조에 넣어야 해서 단순 치환이 아니다.
+        #   그때까지 self.cost_spec 으로 오용을 막는다(아래).
         base_W = [5.0, 5.0, 10.0,          # Q_v
                   20.0,                     # Q_z
                   1.0, 1.0, 1.0,            # Q_w
