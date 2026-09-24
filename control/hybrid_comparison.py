@@ -37,6 +37,20 @@ NX_V = 13   # [p(3), v(3), q(4), ω(3)]
 NU_V = 4    # [T, ν_ωx, ν_ωy, ν_ωz]
 
 
+def rotor_thrust_cap(params, V_axial):
+    """유속 V_axial·명목 최대 회전수에서의 로터별 추력 상한 f_max,i (식A2).
+
+    전진비 J가 커지면 같은 회전수로 낼 수 있는 추력이 줄어든다. 이 상한은
+    제어법칙의 선택이 아니라 물리적 사실이므로, 제약 배분(A1)과 기하 외부
+    루프의 적분기 정지 판정이 같은 값을 써야 한다 — 그래서 모듈 함수로 뺐다.
+    """
+    n_i = params['n_max']
+    n_rps = n_i / (2 * np.pi)
+    J = V_axial / (n_rps * params['D_prop'] + 1e-8)
+    fac = max(1.0 - J / params['J_max'], 0.0)
+    return np.full(4, params['k_T'] * n_i**2 * fac)
+
+
 def build_virtual_dynamics(params):
     """
     가상 명령 동역학: ω̇ = ν_ω (INDI가 실현).
@@ -718,11 +732,7 @@ class ProperHybrid:
 
     def _rotor_thrust_cap(self, V_axial):
         """현재 유속·명목 최대 회전수에서 로터별 추력 상한 f_max,i (식A2)."""
-        n_i = self.p['n_max']
-        n_rps = n_i / (2 * np.pi)
-        J = V_axial / (n_rps * self.p['D_prop'] + 1e-8)
-        fac = max(1.0 - J / self.p['J_max'], 0.0)
-        return np.full(4, self.p['k_T'] * n_i**2 * fac)
+        return rotor_thrust_cap(self.p, V_axial)
 
     def _compute_G(self, n, v_body=None):
         return compute_control_effectiveness(self.p, n, v_body)
